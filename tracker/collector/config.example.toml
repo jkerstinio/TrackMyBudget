@@ -24,3 +24,8 @@ days = 40                                # so weit zurück wird gesucht
 
 [paths]
 data = "../data"                         # Datenordner des Trackers, relativ zu diesem Ordner
+
+[drive]                                  # Tracker-Daten in Google Drive (optional)
+enabled = false                          # nach "drive_verbinden.cmd" auf true setzen
+client_id = ""                           # OAuth-Client vom Typ "Desktop-App" aus demselben Google-Cloud-Projekt wie der Tracker
+client_secret = ""                       # gehört zum Desktop-Client; bleibt in dieser (von Git ausgeschlossenen) Datei

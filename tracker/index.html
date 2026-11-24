@@ -268,6 +268,7 @@ const ICONS = { cart: "🛒", ticket: "🎟️", cup: "🥤", house: "🏠", car
 const hueStyle = c => `--h:${c?.hue ?? 0};--k:${c?.hue == null ? 0 : 1}`;
 const colorOf = (c, l = 68) => c && c.hue != null ? `oklch(${l}% .13 ${c.hue})` : `oklch(${l}% .01 80)`;
 const SVGP = {
+  cloud: '<path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/>',
   box: '<path d="M21 8 12 3 3 8v8l9 5 9-5z"/><path d="m3 8 9 5 9-5"/><path d="M12 13v8"/>',
   mail: '<rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-10 6L2 7"/>',
   split: '<path d="M16 3h5v5"/><path d="M8 3H3v5"/><path d="M12 22v-8.3a4 4 0 0 0-1.17-2.87L3 3"/><path d="m15 9 6-6"/>',
@@ -305,6 +306,11 @@ const Store = {
   async kvGet(k) { const db = await this.idb(); return new Promise(res => { const q = db.transaction("kv").objectStore("kv").get(k); q.onsuccess = () => res(q.result); q.onerror = () => res(null); }); },
   async kvSet(k, v) { const db = await this.idb(); return new Promise(res => { const t = db.transaction("kv", "readwrite"); t.objectStore("kv").put(v, k); t.oncomplete = () => res(); }); },
   async init() {
+    if (localStorage.getItem("tmb-store") === "drive" && driveOk()) {
+      this.wantDrive = true;
+      if (Drive.restore()) { try { await this.loadDrive(); } catch (e) { console.warn(e); } }
+      return;
+    }
     if (this.supported) {
       try {
         const h = await this.kvGet("dir");
@@ -324,6 +330,29 @@ const Store = {
     }
     this.mode = "dir"; this.afterLoad();
   },
+  async loadDrive() {
+    await Drive.open();
+    for (const f of FILES) { const t = await Drive.read(f + ".json"); DB[f] = t ? JSON.parse(t) : []; }
+    this.mode = "drive"; this.versions = Object.fromEntries(FILES.map(f => [f, Drive.files[f + ".json"]?.version])); this.afterLoad();
+  },
+  // Mit Google Drive verbinden. upload = aktuelle Daten (Ordner/Browser) nach Drive übernehmen
+  async connectDrive(upload) {
+    await Drive.signIn(); await Drive.open();
+    if (upload && Drive.files["transactions.json"] && !confirm("In deinem Google Drive liegen schon TrackMyBudget-Daten. Mit den Daten von hier ersetzen?\n(Abbrechen = die Daten aus Drive verwenden)")) upload = false;
+    if (upload) { for (const f of FILES) await Drive.write(f + ".json", this.serialize(DB[f])); if (this.mode === "dir") await this.copyInboxToDrive(); }
+    localStorage.setItem("tmb-store", "drive"); this.wantDrive = true;
+    await this.loadDrive();
+  },
+  // beim Umzug: Bank-Inbox und offene Belege aus dem Ordner mitnehmen (danach lädt der Sammler sie selbst hoch)
+  async copyInboxToDrive() {
+    try { const f = await (await this.dir.getFileHandle("bank_inbox.json")).getFile(); await Drive.write("bank_inbox.json", await f.text()); } catch { }
+    try {
+      const rd = await (await this.dir.getDirectoryHandle("inbox")).getDirectoryHandle("receipts"), dst = await Drive.folder("receipts");
+      for await (const [n, fh] of rd.entries()) if (fh.kind === "file" && /\.pdf$/i.test(n)) await Drive.write(n, await (await fh.getFile()).arrayBuffer(), "application/pdf", dst);
+    } catch { }
+  },
+  leaveDrive() { localStorage.removeItem("tmb-store"); try { sessionStorage.removeItem("tmb-gtok"); } catch { } location.reload(); },
+  async reauth() { await Drive.signIn(); if (this.mode !== "drive") await this.loadDrive(); else { this.error = null; this.errKind = null; if (this.dirty.size) await this.flush(); } },
   loadLocal() { this.mode = "local"; try { Object.assign(DB, JSON.parse(localStorage.getItem("tmb-db") || "{}")); } catch { } this.afterLoad(); },
   afterLoad() {
     for (const f of FILES) DB[f] ||= [];
@@ -336,9 +365,17 @@ const Store = {
     const names = [...this.dirty]; this.dirty.clear();
     try {
       if (this.mode === "dir") { await this.dailyBackup(); for (const n of names) await this.write(this.dir, n + ".json", this.serialize(DB[n])); }
+      else if (this.mode === "drive") {
+        if (this.backedUp !== todayStr()) { await Drive.backup(todayStr()); this.backedUp = todayStr(); }
+        // anderes Gerät hat inzwischen gespeichert? Dann nicht überschreiben
+        await Drive.refresh();
+        const clash = names.filter(n => Drive.files[n + ".json"] && this.versions[n] && Drive.files[n + ".json"].version !== this.versions[n]);
+        if (clash.length) throw Object.assign(new Error("Daten wurden auf einem anderen Gerät geändert"), { clash: true });
+        for (const n of names) this.versions[n] = (await Drive.write(n + ".json", this.serialize(DB[n]))).version;
+      }
       else if (this.mode === "local") localStorage.setItem("tmb-db", JSON.stringify(DB));
-      this.error = null; this.lastSaved = new Date();
-    } catch (e) { this.error = e.message; names.forEach(n => this.dirty.add(n)); }
+      this.error = null; this.errKind = null; this.lastSaved = new Date();
+    } catch (e) { this.error = e.message; this.errKind = e.auth ? "auth" : e.clash ? "clash" : null; names.forEach(n => this.dirty.add(n)); }
     updateStatus();
   },
   // Einmal pro Tag vor dem ersten Schreiben: Kopie aller Dateien nach backups/JJJJ-MM-TT, die letzten 30 bleiben
@@ -350,6 +387,84 @@ const Store = {
     for (const f of FILES) if (DB[f].length || force) await this.write(d, f + ".json", this.serialize(DB[f]));
     const days = []; for await (const [n, h] of root.entries()) if (h.kind === "directory") days.push(n);
     days.sort(); for (const old of days.slice(0, Math.max(0, days.length - 30))) await root.removeEntry(old, { recursive: true });
+  },
+};
+
+/* ============================ Speicher: Google Drive ============================ */
+// OAuth-Client der Web-App (öffentlich, kein Geheimnis). Zugriff nur auf Dateien, die TrackMyBudget selbst angelegt hat (drive.file).
+const GDRIVE = { clientId: "1088365926716-aekim6i0vcfa1ln0p2m0742b96jrg2m8.apps.googleusercontent.com", scope: "https://www.googleapis.com/auth/drive.file" };
+const driveOk = () => !!GDRIVE.clientId && location.protocol === "https:";
+const Drive = {
+  token: null, exp: 0, root: null, files: {}, sub: {},
+  async gis() {
+    if (window.google?.accounts?.oauth2) return;
+    await new Promise((res, rej) => { const s = document.createElement("script"); s.src = "https://accounts.google.com/gsi/client"; s.onload = res; s.onerror = () => rej(new Error("Google-Anmeldung nicht erreichbar")); document.head.append(s); });
+  },
+  // braucht einen Klick (Popup). Ist die Freigabe schon erteilt, schließt sich das Fenster sofort wieder.
+  async signIn() {
+    await this.gis();
+    return new Promise((res, rej) => {
+      const tc = google.accounts.oauth2.initTokenClient({ client_id: GDRIVE.clientId, scope: GDRIVE.scope,
+        callback: r => { if (r.error) return rej(new Error(r.error_description || r.error)); this.token = r.access_token; this.exp = Date.now() + (Number(r.expires_in) - 120) * 1000; try { sessionStorage.setItem("tmb-gtok", JSON.stringify({ t: this.token, e: this.exp })); } catch { } res(); },
+        error_callback: e => rej(new Error(e?.type === "popup_closed" ? "Anmeldung abgebrochen" : e?.type === "popup_failed_to_open" ? "Popup blockiert – bitte Popups für diese Seite erlauben" : "Anmeldung fehlgeschlagen")) });
+      tc.requestAccessToken();
+    });
+  },
+  restore() { try { const o = JSON.parse(sessionStorage.getItem("tmb-gtok") || "null"); if (o && o.e > Date.now()) { this.token = o.t; this.exp = o.e; return true; } } catch { } return false; },
+  valid() { return !!this.token && this.exp > Date.now(); },
+  async api(path, opt = {}) {
+    if (!this.valid()) throw Object.assign(new Error("Google-Anmeldung abgelaufen"), { auth: true });
+    const r = await fetch(path.startsWith("http") ? path : "https://www.googleapis.com/drive/v3/" + path, { ...opt, headers: { Authorization: "Bearer " + this.token, ...(opt.headers || {}) } });
+    if (r.status === 401) { this.token = null; throw Object.assign(new Error("Google-Anmeldung abgelaufen"), { auth: true }); }
+    if (!r.ok) throw new Error("Google Drive " + r.status + ": " + (await r.text()).slice(0, 160));
+    return r;
+  },
+  async list(q) {
+    const out = []; let pt = "";
+    do {
+      const r = await (await this.api("files?" + new URLSearchParams({ q: q + " and trashed=false", fields: "nextPageToken,files(id,name,mimeType,modifiedTime,version)", pageSize: 1000, ...(pt ? { pageToken: pt } : {}) }))).json();
+      out.push(...r.files); pt = r.nextPageToken;
+    } while (pt);
+    return out;
+  },
+  async mkdir(name, parent, props) {
+    const meta = { name, mimeType: "application/vnd.google-apps.folder", ...(parent ? { parents: [parent] } : {}), ...(props ? { appProperties: props } : {}) };
+    return (await (await this.api("files?fields=id", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(meta) })).json()).id;
+  },
+  // Hauptordner "TrackMyBudget" (vom Tracker oder vom Sammler angelegt, erkennbar am appProperty tmb=root)
+  async open() {
+    const f = (await this.list("appProperties has { key='tmb' and value='root' }"))[0];
+    this.root = f ? f.id : await this.mkdir("TrackMyBudget", null, { tmb: "root" });
+    await this.refresh();
+  },
+  async refresh() { this.files = {}; for (const f of await this.list(`'${this.root}' in parents`)) if (f.mimeType.endsWith("folder")) this.sub[f.name] = f.id; else this.files[f.name] = f; },
+  async folder(name) { return this.sub[name] ||= await this.mkdir(name, this.root); },
+  async read(name) { const f = this.files[name]; return f ? (await this.api(`files/${f.id}?alt=media`)).text() : null; },
+  async write(name, body, mime = "application/json", parent) {
+    const f = parent ? null : this.files[name];
+    let r;
+    if (f) r = await this.api(`https://www.googleapis.com/upload/drive/v3/files/${f.id}?uploadType=media&fields=id,name,modifiedTime,version`, { method: "PATCH", headers: { "Content-Type": mime }, body });
+    else {
+      const fd = new FormData();
+      fd.append("metadata", new Blob([JSON.stringify({ name, parents: [parent || this.root] })], { type: "application/json" }));
+      fd.append("file", new Blob([body], { type: mime }));
+      r = await this.api("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,modifiedTime,version", { method: "POST", body: fd });
+    }
+    const m = await r.json(); if (!parent) this.files[name] = m; return m;
+  },
+  async blob(folder, name) {
+    if (!this.sub[folder]) await this.refresh();
+    const id = this.sub[folder]; if (!id) throw new Error("Ordner „" + folder + "“ fehlt in Google Drive");
+    const f = (await this.list(`'${id}' in parents and name='${name.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`))[0]; if (!f) throw new Error("Datei nicht gefunden: " + name);
+    return new File([await (await this.api(`files/${f.id}?alt=media`)).blob()], name, { type: "application/pdf" });
+  },
+  // einmal pro Tag: Kopie aller Dateien nach backups/JJJJ-MM-TT, die letzten 30 bleiben
+  async backup(day) {
+    const b = await this.folder("backups"), days = await this.list(`'${b}' in parents and mimeType='application/vnd.google-apps.folder'`);
+    if (days.some(d => d.name === day)) return;
+    const d = await this.mkdir(day, b);
+    for (const n of FILES) { const f = this.files[n + ".json"]; if (f) await this.api(`files/${f.id}/copy?fields=id`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: n + ".json", parents: [d] }) }); }
+    for (const old of days.sort((x, y) => x.name.localeCompare(y.name)).slice(0, Math.max(0, days.length + 1 - 30))) await this.api(`files/${old.id}`, { method: "DELETE" });
   },
 };
 
@@ -609,7 +724,8 @@ function toast(msg, action) {
 }
 function updateStatus() {
   const el = $("#status"); if (!el) return;
-  el.innerHTML = Store.error ? `<b class="bad">Fehler beim Speichern</b><br>${esc(Store.error)}`
+  el.innerHTML = Store.error ? `<b class="bad">Nicht gespeichert</b><br>${esc(Store.error)}${Store.errKind === "auth" ? '<br><button class="btn sm" data-act="gauth" style="margin-top:6px">Neu anmelden</button>' : Store.errKind === "clash" ? '<br><button class="btn sm" data-act="greload" style="margin-top:6px">Neu laden</button>' : ""}`
+    : Store.mode === "drive" ? `<b>● Google Drive</b><br>${Store.lastSaved ? "gespeichert " + Store.lastSaved.toLocaleTimeString("de-DE") : "verbunden"}`
     : Store.mode === "dir" ? `<b>● Ordner „${esc(Store.dir.name)}“</b><br>${Store.lastSaved ? "gespeichert " + Store.lastSaved.toLocaleTimeString("de-DE") : "verbunden"}`
       : `<b>● Browser-Speicher</b><br>nur in diesem Browser – bitte exportieren`;
 }
@@ -650,8 +766,13 @@ function render() {
 }
 function splash() {
   const btn = Store.supported ? (Store.pending ? `<button class="btn primary" data-act="regrant">Zugriff auf „${esc(Store.pending.name)}“ erlauben</button> <button class="btn" data-act="pick">Anderen Ordner wählen</button>` : `<button class="btn primary" data-act="pick">Datenordner wählen</button>`) : "";
+  if (Store.wantDrive) return `<div class="splash"><div class="logo" style="margin:auto;width:48px;height:48px">${ic("wallet", 26)}</div><h1>TrackMyBudget</h1>
+    <p>Deine Daten liegen in Google Drive.</p><button class="btn primary" data-act="gauth">${ic("cloud", 16)}Mit Google Drive verbinden</button>
+    <p style="margin-top:18px"><button class="btn ghost sm" data-act="gleave">Stattdessen Ordner oder Browser-Speicher nutzen</button></p></div>`;
+  const gd = driveOk() ? `<div style="margin-top:22px;padding-top:18px;border-top:1px solid var(--border)"><button class="btn primary" data-act="gconnect">${ic("cloud", 16)}Mit Google Drive verbinden</button>
+    <p class="faint" style="font-size:12.5px;margin-top:8px">Funktioniert auf jedem Gerät. Der Tracker sieht nur seinen eigenen Ordner „TrackMyBudget“ in deinem Drive.</p></div>` : "";
   return `<div class="splash"><div class="logo" style="margin:auto;width:48px;height:48px">${ic("wallet", 26)}</div><h1>TrackMyBudget</h1>
-  <p>Wähle den Ordner mit deinen JSON-Dateien (z. B. <code>tracker/data</code> oder ein Ordner in OneDrive). Ist er leer, wird dort eine neue Datenbank angelegt.</p>${btn}
+  <p>Wähle den Ordner mit deinen JSON-Dateien (z. B. <code>tracker/data</code> oder ein Ordner in OneDrive). Ist er leer, wird dort eine neue Datenbank angelegt.</p>${btn}${gd}
   ${Store.supported ? "" : `<p class="neg" style="margin-top:16px">Dieser Browser kann keine Ordner beschreiben – bitte Edge oder Chrome verwenden.</p>`}</div>`;
 }
 const head = (title, sub, right = "") => `<div class="ph"><div><h1>${title}</h1><p class="sub">${sub}</p></div><div>${right}</div></div>`;
@@ -1453,8 +1574,8 @@ PAGES.settings = function () {
     <p style="margin-top:10px"><button class="btn sm danger" data-act="clearrules">Gelernte Zuordnungen löschen</button></p></div></div>
   <div><div class="panel"><h2>Bank-Import</h2><p class="sub">Umsätze kommen über den Sammler (<code>tracker/collector</code>) von der ING.</p>
     <p style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px">Übernahme ab <input type="date" data-act="banksinceset" value="${bankSince()}"><span class="faint">${DB.bank_rules.length} gelernte Gegenseiten</span>${DB.bank_rules.length ? '<button class="btn sm danger" data-act="clearbankrules">Regeln löschen</button>' : ""}</p></div>
-  <div class="panel"><h2>Speicher</h2><p style="margin:8px 0 14px;line-height:1.5">${Store.mode === "dir" ? `Ordner <b>${esc(Store.dir.name)}</b> – jede Änderung wird sofort in die JSON-Dateien geschrieben. Einmal täglich entsteht automatisch eine Kopie in <code>backups/</code> (30 Tage).` : `Daten liegen nur im Browser-Speicher. Bitte regelmäßig exportieren.`}</p>
-    <p style="display:flex;gap:8px;flex-wrap:wrap">${Store.supported ? `<button class="btn" data-act="pick">Anderen Ordner wählen</button>` : ""}${Store.mode === "dir" ? `<button class="btn" data-act="backupnow">Jetzt sichern</button>` : ""}
+  <div class="panel"><h2>Speicher</h2><p style="margin:8px 0 14px;line-height:1.5">${Store.mode === "drive" ? `<b>Google Drive</b>, Ordner „TrackMyBudget“ – jede Änderung wird sofort gespeichert. Einmal täglich entsteht eine Kopie in <code>backups/</code> (30 Tage). Der Tracker sieht nur diesen Ordner.` : Store.mode === "dir" ? `Ordner <b>${esc(Store.dir.name)}</b> – jede Änderung wird sofort in die JSON-Dateien geschrieben. Einmal täglich entsteht automatisch eine Kopie in <code>backups/</code> (30 Tage).` : `Daten liegen nur im Browser-Speicher. Bitte regelmäßig exportieren.`}</p>
+    <p style="display:flex;gap:8px;flex-wrap:wrap">${Store.mode === "drive" ? `<button class="btn" data-act="gleave">Google Drive trennen</button>` : driveOk() ? `<button class="btn primary" data-act="gmove">${ic("cloud", 15)}Zu Google Drive umziehen</button>` : ""}${Store.supported && Store.mode !== "drive" ? `<button class="btn" data-act="pick">Anderen Ordner wählen</button>` : ""}${Store.mode === "dir" ? `<button class="btn" data-act="backupnow">Jetzt sichern</button>` : ""}
     <button class="btn" data-act="export">Alles exportieren</button><button class="btn" data-act="import">Importieren …</button></p><input type="file" id="importFile" accept=".json" hidden>
     <p class="faint" style="font-size:12.5px;margin-top:14px">${DB.transactions.length} Buchungen · ${DB.categories.length} Kategorien · ${DB.tags.length} Tags · ${DB.budgets.length} Budgets</p></div></div></div>`;
 };
@@ -1475,6 +1596,15 @@ const bankAmt = t => t.bank?.amount ?? t.amount;
 const GENERIC_KEYS = new Set(["paypal", "amazon", "amzn"]);
 
 async function loadInbox(force) {
+  if (Store.mode === "drive") {
+    try {
+      if (!Drive.valid()) return;
+      await Drive.refresh(); const f = Drive.files["bank_inbox.json"], v = f ? f.version : 0;
+      if (!force && v === Inbox.mtime) return;
+      Inbox.mtime = v; Inbox.data = f ? JSON.parse(await Drive.read("bank_inbox.json")) : null;
+    } catch (e) { console.warn(e); return; }
+    processInbox(); render(); return;
+  }
   if (Store.mode !== "dir") return;
   try {
     const f = await (await Store.dir.getFileHandle("bank_inbox.json")).getFile();
@@ -1705,6 +1835,7 @@ function ignoreQueued(id, learn) {
   Store.touch("bank_ack", "bank_rules"); processInbox();
 }
 async function inboxFile(name) {
+  if (Store.mode === "drive") return Drive.blob("receipts", name);
   const dir = await (await Store.dir.getDirectoryHandle("inbox")).getDirectoryHandle("receipts");
   return (await dir.getFileHandle(name)).getFile();
 }
@@ -1751,7 +1882,7 @@ function inboxHelp() {
 }
 function inboxStatus() {
   const d = Inbox.data;
-  if (Store.mode !== "dir") return `<div class="warnbox">Der Bank-Import braucht den Datenordner (Edge/Chrome).</div>`;
+  if (Store.mode !== "dir" && Store.mode !== "drive") return `<div class="warnbox">Der Bank-Import braucht den Datenordner oder Google Drive.</div>`;
   if (!d) return `<div class="panel"><h2>Noch kein Abruf</h2><p class="sub" style="line-height:1.6">Im Ordner <code>tracker/collector</code> einmal <b>einrichten.cmd</b> starten (Passwort im Windows-Speicher ablegen, Freigabe in der ING-App), danach <b>aufgabe_anlegen.cmd</b> für den täglichen Abruf. Der Sammler schreibt <code>bank_inbox.json</code> in diesen Ordner.</p></div>`;
   const age = d.bank_at ? dayDiff(d.bank_at.slice(0, 10), todayStr()) : null;
   const when = d.bank_at ? new Date(d.bank_at).toLocaleString("de-DE", { dateStyle: "short", timeStyle: "short" }) : "nie";
@@ -1849,6 +1980,8 @@ PAGES.inbox = function () {
 
 /* ============================ Ereignisse ============================ */
 document.addEventListener("click", async e => {
+  // Google-Anmeldung gilt eine Stunde: kurz vor Ablauf beim nächsten Klick still erneuern (Popup braucht einen Klick)
+  if (Store.mode === "drive" && Drive.token && Drive.exp - Date.now() < 10 * 60e3 && !Drive.renewing) { Drive.renewing = true; Drive.signIn().catch(() => { }).finally(() => { Drive.renewing = false; }); }
   if (gfOpen && !e.target.closest(".gfi")) { gfOpen = null; render(); }
   const el = e.target.closest("[data-act]"); if (!el) return;
   if (["INPUT", "SELECT"].includes(el.tagName) && el.type !== "checkbox") return;
@@ -1886,6 +2019,10 @@ document.addEventListener("click", async e => {
       case "gfmonths": S.months = Number(v); S.rmode = "months"; gfOpen = null; S.limit = 100; saveUI(); render(); break;
       case "gfyear": S.rmode = "year"; S.year = v; gfOpen = null; S.limit = 100; saveUI(); render(); break;
       case "pick": await Store.pick(); render(); loadInbox(true); break;
+      case "gconnect": case "gmove": try { await Store.connectDrive(a === "gmove"); render(); loadInbox(true); toast("Mit Google Drive verbunden"); } catch (err) { toast(err.message); } break;
+      case "gauth": try { await Store.reauth(); render(); loadInbox(true); } catch (err) { toast(err.message); } break;
+      case "greload": if (confirm("Daten aus Google Drive neu laden? Deine letzte, nicht gespeicherte Änderung geht dabei verloren.")) { Store.dirty.clear(); Store.error = null; Store.errKind = null; await Store.loadDrive(); render(); loadInbox(true); } break;
+      case "gleave": if (confirm("Google Drive trennen? Die Daten bleiben in Drive. Danach kannst du einen Ordner wählen.")) Store.leaveDrive(); break;
       case "regrant": await Store.regrant(); render(); loadInbox(true); break;
       case "addtx": txDialog(); break;
       case "edittx": txDialog(DB.transactions.find(t => t.id === id)); break;

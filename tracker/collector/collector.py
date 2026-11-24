@@ -7,6 +7,7 @@ alles nach <data>/bank_inbox.json. Der Tracker übernimmt die Inbox beim Öffnen
   collector.py setup     PIN und Gmail-App-Passwort im Windows-Speicher ablegen, erster Lauf mit Freigabe
   collector.py run       Abruf (für die Aufgabenplanung; fragt nichts, bricht bei nötiger Freigabe ab)
   collector.py run -i    Abruf mit Rückfragen und Freigabe in der ING-App
+  collector.py drive     einmalig mit Google Drive verbinden (Tracker-Daten liegen dann in Drive)
   collector.py status    letzten Lauf anzeigen
   collector.py forget    PIN und App-Passwort aus dem Windows-Speicher löschen
 """
@@ -38,6 +39,7 @@ STATE = LOCAL / "fints_state.bin"
 LOG = LOCAL / "collector.log"
 KR_FINTS = "TrackMyBudget-FinTS"
 KR_GMAIL = "TrackMyBudget-Gmail"
+KR_DRIVE = "TrackMyBudget-Drive"
 DAYS = 35
 
 log = logging.getLogger("collector")
@@ -250,12 +252,52 @@ def fetch_mail(cfg: dict, data: Path, ack: dict) -> dict:
             "mails": store["amounts"]}
 
 
+# ----------------------------------------------------------------- Google Drive
+def open_drive(cfg: dict):
+    """Drive-Verbindung, wenn in config.toml eingeschaltet und mit 'collector.py drive' verbunden."""
+    d = cfg.get("drive", {})
+    if not d.get("enabled"):
+        return None
+    from gdrive import Drive
+    tok = secret(KR_DRIVE, d["client_id"])
+    if not tok:
+        raise RuntimeError("nicht verbunden – drive_verbinden.cmd starten")
+    drv = Drive(d["client_id"], d["client_secret"], tok)
+    drv.open()
+    return drv
+
+
+def drive_setup():
+    import keyring
+    from gdrive import Drive, authorize
+    d = load_config().get("drive", {})
+    if not d.get("client_id") or not d.get("client_secret"):
+        sys.exit("In config.toml unter [drive] client_id und client_secret eintragen (Desktop-Client aus dem Google-Cloud-Projekt).")
+    keyring.set_password(KR_DRIVE, d["client_id"], authorize(d["client_id"], d["client_secret"]))
+    drv = Drive(d["client_id"], d["client_secret"], keyring.get_password(KR_DRIVE, d["client_id"]))
+    drv.open()
+    print(f"Verbunden. Ordner „TrackMyBudget“ in Google Drive: {len(drv.files)} Dateien.")
+    if not d.get("enabled"):
+        print('Jetzt in config.toml unter [drive] "enabled = true" setzen.')
+
+
 # ----------------------------------------------------------------- Ablauf
 def run(interactive: bool) -> int:
     cfg = load_config()
     data = data_dir(cfg)
     if not data.exists():
         sys.exit(f"Datenordner nicht gefunden: {data}")
+    # Tracker-Daten aus Drive holen (bank_ack.json braucht der Sammler, der Rest ist lokale Sicherung)
+    drv, drive_status = None, "aus"
+    try:
+        drv = open_drive(cfg)
+        if drv:
+            got = drv.pull(data)
+            drive_status = "ok"
+            log.info("Drive: %d Dateien geholt", len(got))
+    except Exception as e:  # noqa: BLE001
+        drv, drive_status = None, f"Fehler: {e}"
+        log.error("Drive-Fehler: %s\n%s", e, traceback.format_exc())
     inbox_path = data / "bank_inbox.json"
     prev = json.loads(inbox_path.read_text(encoding="utf-8")) if inbox_path.exists() else {}
     ack_path = data / "bank_ack.json"
@@ -285,10 +327,18 @@ def run(interactive: bool) -> int:
     except Exception as e:  # noqa: BLE001
         inbox["mail"] = {**inbox.get("mail", {}), "status": f"Fehler: {e}"}
         log.error("Gmail-Fehler: %s\n%s", e, traceback.format_exc())
+    inbox["drive"] = drive_status
     write_json_atomic(inbox_path, inbox)
+    if drv:
+        try:
+            up, gone = drv.push(data)
+            log.info("Drive: Inbox hochgeladen, Belege +%d −%d", up, gone)
+        except Exception as e:  # noqa: BLE001
+            drive_status = f"Fehler: {e}"
+            log.error("Drive-Upload: %s\n%s", e, traceback.format_exc())
     msg = {0: "fertig", 1: "mit Fehler", 2: "Freigabe nötig"}[code]
     print(f"Sammler {msg}: {len(inbox['items'])} Umsätze, Belege: {len(inbox['mail'].get('receipts', []))}, "
-          f"Gmail: {inbox['mail'].get('status')}" + (f"\n{inbox['message']}" if inbox["message"] else ""))
+          f"Gmail: {inbox['mail'].get('status')}, Drive: {drive_status}" + (f"\n{inbox['message']}" if inbox["message"] else ""))
     return code
 
 
@@ -312,7 +362,8 @@ def setup():
 def forget():
     import keyring
     cfg = load_config()
-    for svc, user in ((KR_FINTS, cfg["fints"].get("login")), (KR_GMAIL, cfg.get("gmail", {}).get("address"))):
+    for svc, user in ((KR_FINTS, cfg["fints"].get("login")), (KR_GMAIL, cfg.get("gmail", {}).get("address")),
+                      (KR_DRIVE, cfg.get("drive", {}).get("client_id"))):
         if not user:
             continue
         try:
@@ -350,6 +401,8 @@ def main():
         sys.exit(setup())
     if cmd == "run":
         sys.exit(run(interactive="-i" in sys.argv))
+    if cmd == "drive":
+        return drive_setup()
     if cmd == "status":
         return status()
     if cmd == "forget":

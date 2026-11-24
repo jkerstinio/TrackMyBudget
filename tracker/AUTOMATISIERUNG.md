@@ -29,6 +29,16 @@ Der Tracker übernimmt alles auf der Seite **„Neue Umsätze“**.
 4. Tracker öffnen → „Neue Umsätze“ → **Übernahme-Datum** wählen (Vorschlag: Tag nach der letzten eigenen Buchung; überlappende Handeinträge werden verknüpft).
 5. **`aufgabe_anlegen.cmd`** starten: täglicher Abruf um 7:00 und bei der Anmeldung, ohne Fenster.
 
+## Google Drive (optional)
+
+Statt im lokalen Ordner können die Daten in Google Drive liegen. Dann öffnet man den Tracker auf jedem Gerät, klickt auf **„Mit Google Drive verbinden“** und muss keinen Ordner wählen. Der Tracker legt in Drive den Ordner **„TrackMyBudget“** an und sieht nur diesen (Zugriff `drive.file`).
+
+- **Umzug:** Tracker mit dem bisherigen Ordner öffnen → Einstellungen → **„Zu Google Drive umziehen“**. Alle Daten, die Bank-Inbox und offene Belege werden hochgeladen.
+- **Sammler:** In `config.toml` unter `[drive]` die Desktop-Client-ID und das Secret eintragen, **`drive_verbinden.cmd`** einmal starten und `enabled = true` setzen. Danach holt der Sammler bei jedem Lauf die Tracker-Daten aus Drive in den lokalen Datenordner (dient zugleich als Sicherung) und lädt `bank_inbox.json` und neue Belege hoch.
+- **Sicherung:** Der Tracker legt in Drive täglich eine Kopie unter `backups/JJJJ-MM-TT` an (30 Tage).
+- **Zwei Geräte gleichzeitig:** Hat ein anderes Gerät inzwischen gespeichert, überschreibt der Tracker nichts, sondern meldet „Neu laden“.
+- **Voraussetzung:** ein Google-Cloud-Projekt mit aktivierter Drive API, je ein OAuth-Client für die Web-App (Herkunft = Pages-Adresse) und die Desktop-App. Die Web-Client-ID steht in `index.html` (`GDRIVE.clientId`), sie ist kein Geheimnis.
+
 ## Im Alltag
 
 - Tracker öffnen, „Neue Umsätze“ abarbeiten. Die Seite liest `bank_inbox.json` beim Öffnen, beim Zurückkehren ins Fenster und alle 2 Minuten neu.
