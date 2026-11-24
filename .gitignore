@@ -1,0 +1,32 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+.claude/
+
+# Alte App und Reste davon: bleiben lokal, nie auf GitHub
+archiv/
+backend/
+frontend/
+
+# Persönliche Finanzdaten - nie committen
+*.xlsx
+*.xls
+*.csv
+*.png
+*.jpg
+*.jpeg
+*.pdf
+backups/
+Belege/
+
+# Persönliche Daten des JSON-Trackers
+tracker/data/
+
+# Persönliche Notizen
+tracker/TODO.md
+
+# Sammler: lokale Konfiguration mit FinTS-Produkt-ID
+tracker/collector/config.toml
+tracker/collector/__pycache__/

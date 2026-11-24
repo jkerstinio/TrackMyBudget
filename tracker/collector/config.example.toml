@@ -1,0 +1,26 @@
+# Vorlage. Kopie als config.toml anlegen (die ist von Git ausgeschlossen).
+# Keine Passwörter hier eintragen - die legt "collector.py setup" im Windows-Speicher ab.
+
+[fints]
+product_id = ""                          # 25-stellige Registrierungsnummer aus der Mail der DK
+blz = "50010517"                         # ING
+url = "https://fints.ing.de/fints/"      # laut FinTS-Institutsliste
+login = ""                               # ING Benutzername
+own_names = []                           # eigene Namen: Überweisungen von/an diese gelten als Umbuchung
+
+[accounts]                               # IBAN = Kontoname im Tracker (nur diese Konten werden abgerufen)
+# "DE00…" = "Persönlich"
+
+[depot]
+enabled = true                           # Depotwert über FinTS abfragen
+
+[gmail]
+address = ""                             # Gmail-Adresse; App-Passwort legt "setup" im Windows-Speicher ab
+days = 40                                # so weit zurück wird gesucht
+# Keine Labels oder Filter nötig. Eigene Gmail-Suchen nur bei Bedarf, sonst gelten die Standards aus mail.py:
+# [gmail.queries]
+# receipts = "has:attachment filename:pdf {rechnung beleg ebon}"      # PDF-Belege
+# amounts  = "-category:promotions {rechnung bestellung zahlung}"     # Mails mit Euro-Beträgen
+
+[paths]
+data = "../data"                         # Datenordner des Trackers, relativ zu diesem Ordner
